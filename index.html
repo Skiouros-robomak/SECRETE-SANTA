@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secret Santa</title>
+<style>
+  :root { --red:#c0392b; --green:#1e6b4a; --cream:#fff8ec; --ink:#2b2220; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; color:var(--ink);
+         background: linear-gradient(180deg,#a93226 0,#7b241c 100%); min-height:100vh; display:flex; justify-content:center; padding:20px 16px; }
+  .card { background:var(--cream); width:100%; max-width:420px; border-radius:20px; padding:24px; align-self:flex-start;
+          box-shadow:0 10px 30px rgba(0,0,0,.3); }
+  h1 { margin:0 0 4px; font-size:1.7rem; text-align:center; }
+  .sub { text-align:center; color:#6b5b55; margin:0 0 20px; }
+  label { display:block; font-weight:600; margin:14px 0 6px; }
+  input { width:100%; padding:12px 14px; font-size:1.05rem; border:2px solid #e3d5c0; border-radius:12px; background:#fff; }
+  input:focus { outline:none; border-color:var(--green); }
+  button { width:100%; padding:14px; font-size:1.05rem; font-weight:700; border:0; border-radius:12px; cursor:pointer; margin-top:14px;
+           background:var(--green); color:#fff; }
+  button.red { background:var(--red); }
+  button.ghost { background:transparent; color:var(--green); border:2px solid var(--green); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .err { color:#b00020; margin-top:10px; text-align:center; min-height:1.2em; }
+  .code { font-size:2.4rem; letter-spacing:.3em; text-align:center; font-weight:800; color:var(--red); background:#fff; border:2px dashed var(--red);
+          border-radius:14px; padding:10px 0 10px .3em; margin:6px 0 4px; }
+  .hint { text-align:center; color:#6b5b55; font-size:.9rem; }
+  ul { list-style:none; padding:0; margin:12px 0; }
+  li { background:#fff; border-radius:10px; padding:10px 14px; margin:6px 0; display:flex; justify-content:space-between; align-items:center; }
+  li button { width:auto; margin:0; padding:4px 10px; font-size:.85rem; background:#eee; color:#555; }
+  .reveal { text-align:center; padding:10px 0; }
+  .gift { font-size:3rem; }
+  .hidden-name { font-size:1.6rem; font-weight:800; padding:26px 10px; border-radius:16px; background:repeating-linear-gradient(45deg,#c0392b,#c0392b 12px,#a93226 12px,#a93226 24px); color:#fff; cursor:pointer; user-select:none; }
+  .shown-name { font-size:2rem; font-weight:800; padding:22px 10px; border-radius:16px; background:#fff; color:var(--green); border:3px solid var(--green); }
+  .row { display:flex; gap:8px; }
+  .link { background:none; border:0; color:#6b5b55; text-decoration:underline; font-size:.85rem; margin-top:18px; width:auto; padding:0; }
+</style>
+</head>
+<body>
+<div class="card" id="app"></div>
+
+<script>
+const app = document.getElementById('app');
+let session = JSON.parse(localStorage.getItem('santa') || 'null'); // {code, token}
+let state = null, timer = null, revealed = false, error = '';
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) } : undefined);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || 'Something went wrong');
+  return data;
+}
+
+function setSession(s) {
+  session = s;
+  if (s) localStorage.setItem('santa', JSON.stringify(s)); else localStorage.removeItem('santa');
+}
+
+function renderHome() {
+  clearInterval(timer);
+  app.innerHTML = `
+    <h1>🎅 Secret Santa</h1>
+    <p class="sub">Draw names without spoiling the surprise</p>
+    <label for="name">Your name</label>
+    <input id="name" maxlength="40" placeholder="e.g. Maria" autocomplete="off">
+    <label for="code">Group code (to join)</label>
+    <input id="code" maxlength="4" placeholder="e.g. K7QD" autocapitalize="characters" autocomplete="off">
+    <button id="join">Join group</button>
+    <button id="create" class="ghost">Create a new group (I'm the admin)</button>
+    <div class="err" id="err">${esc(error)}</div>`;
+  const name = () => document.getElementById('name').value;
+  document.getElementById('join').onclick = async () => {
+    try { setSession(await api('/api/join', { name: name(), code: document.getElementById('code').value })); error=''; start(); }
+    catch (e) { error = e.message; renderHome(); }
+  };
+  document.getElementById('create').onclick = async () => {
+    try { setSession(await api('/api/create', { name: name() })); error=''; start(); }
+    catch (e) { error = e.message; renderHome(); }
+  };
+}
+
+function renderLobby() {
+  const s = state;
+  app.innerHTML = `
+    <h1>🎄 Waiting room</h1>
+    <p class="sub">Hi ${esc(s.myName)}!</p>
+    <div class="hint">Group code – share it with the family</div>
+    <div class="code">${esc(s.code)}</div>
+    <div class="hint">${s.members.length} ${s.members.length === 1 ? 'person has' : 'people have'} joined</div>
+    <ul>${s.members.map((m) => `<li><span>${esc(m)}</span>${s.isAdmin && m !== s.myName ? `<button data-rm="${esc(m)}">remove</button>` : ''}</li>`).join('')}</ul>
+    ${s.isAdmin
+      ? `<button class="red" id="go" ${s.members.length < 3 ? 'disabled' : ''}>Start the draw 🎁</button>
+         <div class="hint" style="margin-top:8px">${s.members.length < 3 ? 'Need at least 3 people' : 'Press when everyone has joined'}</div>`
+      : `<div class="hint">Waiting for the admin to start the draw…</div>`}
+    <div class="err" id="err">${esc(error)}</div>
+    <div style="text-align:center"><button class="link" id="leave">Leave</button></div>`;
+  document.querySelectorAll('[data-rm]').forEach((b) => b.onclick = async () => {
+    try { await api('/api/remove', { ...session, name: b.dataset.rm }); poll(); } catch (e) { error = e.message; renderLobby(); }
+  });
+  const go = document.getElementById('go');
+  if (go) go.onclick = async () => {
+    if (!confirm('Start the draw? Nobody else will be able to join afterwards.')) return;
+    try { await api('/api/start', session); error=''; poll(); } catch (e) { error = e.message; renderLobby(); }
+  };
+  document.getElementById('leave').onclick = () => { setSession(null); renderHome(); };
+}
+
+function renderResult() {
+  const s = state;
+  app.innerHTML = `
+    <div class="reveal">
+      <div class="gift">🎁</div>
+      <h1>You're Secret Santa for…</h1>
+      <p class="sub">Tap to reveal. Make sure nobody is looking!</p>
+      ${revealed ? `<div class="shown-name">${esc(s.myMatch)}</div>` : `<div class="hidden-name" id="box">Tap to reveal</div>`}
+      ${revealed ? `<button class="ghost" id="hide">Hide again</button>` : ''}
+      <p class="hint" style="margin-top:16px">Shh… keep it secret 🤫</p>
+    </div>
+    <div style="text-align:center"><button class="link" id="leave">Leave this group</button></div>`;
+  const box = document.getElementById('box');
+  if (box) box.onclick = () => { revealed = true; renderResult(); };
+  const hide = document.getElementById('hide');
+  if (hide) hide.onclick = () => { revealed = false; renderResult(); };
+  document.getElementById('leave').onclick = () => { if (confirm('Leave? You can rejoin only if you still have this device.')) { setSession(null); renderHome(); } };
+}
+
+let lastKey = '';
+async function poll() {
+  try {
+    state = await api(`/api/state?code=${session.code}&token=${session.token}`);
+    const key = JSON.stringify([state.started, state.members, state.isAdmin, error, revealed]);
+    if (key === lastKey) return; // avoid redrawing needlessly
+    lastKey = key;
+    state.started ? renderResult() : renderLobby();
+  } catch (e) {
+    setSession(null); error = 'Group not found. The server may have been restarted.'; renderHome();
+  }
+}
+
+function start() { lastKey=''; revealed=false; clearInterval(timer); poll(); timer = setInterval(poll, 2000); }
+
+session ? start() : renderHome();
+</script>
+</body>
+</html>
