@@ -6,7 +6,44 @@ const os = require('os');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
-const groups = {}; // code -> { code, adminToken, started, members: [{token,name}], matches: {token: name} }
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+let groups = {}; // code -> { code, adminToken, started, members: [{token,name}], matches: {token: name} }
+
+// Optional permanent storage in a free Upstash Redis database (survives restarts on Render).
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+async function redis(cmd) {
+  const r = await fetch(REDIS_URL, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + REDIS_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(cmd),
+  });
+  if (!r.ok) throw new Error('Redis HTTP ' + r.status);
+  return (await r.json()).result;
+}
+
+async function loadData() {
+  if (REDIS_URL && REDIS_TOKEN) {
+    try {
+      const v = await redis(['GET', 'santa_groups']);
+      groups = v ? JSON.parse(v) : {};
+      console.log('Loaded data from Upstash (' + Object.keys(groups).length + ' groups)');
+      return;
+    } catch (e) { console.error('Could not load from Upstash:', e.message); }
+  }
+  try { groups = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch { groups = {}; }
+}
+
+let saveChain = Promise.resolve();
+function save() {
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify(groups)); } catch (e) { console.error('Could not save file:', e.message); }
+  if (REDIS_URL && REDIS_TOKEN) {
+    const snapshot = JSON.stringify(groups);
+    saveChain = saveChain
+      .then(() => redis(['SET', 'santa_groups', snapshot]))
+      .catch((e) => console.error('Could not save to Upstash:', e.message));
+  }
+}
 
 function makeCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -51,12 +88,18 @@ const server = http.createServer(async (req, res) => {
     return res.end(fs.readFileSync(path.join(__dirname, 'index.html')));
   }
 
+  if (url.pathname === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('ok');
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/create') {
     const { name } = await readBody(req);
     if (!name || !name.trim()) return send(res, 400, { error: 'Enter your name' });
     const code = makeCode();
     const token = makeToken();
     groups[code] = { code, adminToken: token, started: false, members: [{ token, name: name.trim().slice(0, 40) }], matches: {} };
+    save();
     return send(res, 200, { code, token });
   }
 
@@ -71,6 +114,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, { error: 'That name is already taken in this group' });
     const token = makeToken();
     g.members.push({ token, name: clean });
+    save();
     return send(res, 200, { code: g.code, token });
   }
 
@@ -100,6 +144,7 @@ const server = http.createServer(async (req, res) => {
     const perm = derange(g.members.length);
     g.members.forEach((m, i) => { g.matches[m.token] = g.members[perm[i]].name; });
     g.started = true;
+    save();
     return send(res, 200, { ok: true });
   }
 
@@ -110,17 +155,18 @@ const server = http.createServer(async (req, res) => {
     if (g.started) return send(res, 400, { error: 'Already started' });
     const i = g.members.findIndex((m) => m.name === name && m.token !== g.adminToken);
     if (i >= 0) g.members.splice(i, 1);
+    save();
     return send(res, 200, { ok: true });
   }
 
   send(res, 404, { error: 'Not found' });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+loadData().then(() => server.listen(PORT, '0.0.0.0', () => {
   console.log('\n🎅 Secret Santa is running!\n');
   console.log(`  On this computer:  http://localhost:${PORT}`);
   for (const list of Object.values(os.networkInterfaces()))
     for (const i of list)
       if (i.family === 'IPv4' && !i.internal) console.log(`  For the family (same Wi-Fi):  http://${i.address}:${PORT}`);
   console.log('\nPress Ctrl+C to stop.\n');
-});
+}));
